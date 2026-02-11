@@ -1,119 +1,283 @@
 "use client";
 
-import React, { useMemo, useState, useEffect } from "react";
+export const dynamic = "force-dynamic";
+
+import React, { useEffect, useMemo, useState } from "react";
+import JSZip from "jszip";
 import PLYViewer from "./ply-viewer";
 
-type StatusType = "queued" | "running" | "done" | "failed" | "";
+type AnyObj = Record<string, any>;
 
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE?.replace(/\/$/, "") || "";
+  (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "") ||
+  "http://127.0.0.1:8000";
 
+/**
+ * CSRAI UI (Runpod GPU Worker)
+ * - POST /api/train  (multipart/form-data: images_zip=@images.zip)
+ * - GET  /api/jobs/{job_id}
+ * - GET  /api/jobs/{job_id}/gaussians.ply
+ */
 export default function Page() {
   const [files, setFiles] = useState<FileList | null>(null);
+
+  const [isUploading, setIsUploading] = useState(false);
+  const [isPolling, setIsPolling] = useState(true);
+
   const [jobId, setJobId] = useState<string>("");
-  const [status, setStatus] = useState<StatusType>("");
+  const [statusJson, setStatusJson] = useState<AnyObj | null>(null);
+
   const [error, setError] = useState<string>("");
-  const [plyUrl, setPlyUrl] = useState<string>("");
 
-  const canStart = useMemo(() => files && files.length >= 2, [files]);
+  const canStart = useMemo(() => !!files && files.length >= 2, [files]);
 
-  async function startTrain() {
-    if (!API_BASE) {
-      setError("NEXT_PUBLIC_API_BASE 설정 안됨");
-      return;
+  const plyUrl = useMemo(() => {
+    if (!jobId) return "";
+    // Runpod worker가 제공하는 다운로드 엔드포인트
+    return `${API_BASE}/api/jobs/${jobId}/gaussians.ply`;
+  }, [jobId]);
+
+  // 파일 -> zip(blob) 만들기 (브라우저에서 바로)
+  async function buildZipBlob(selected: FileList): Promise<Blob> {
+    const zip = new JSZip();
+
+    // 파일명 충돌 방지 + 정렬 안정성
+    const arr = Array.from(selected);
+    arr.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (let i = 0; i < arr.length; i++) {
+      const f = arr[i];
+      const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
+      const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+      const fname = String(i).padStart(3, "0") + "." + safeExt;
+      zip.file(fname, f);
     }
 
-    if (!canStart || !files) {
+    return await zip.generateAsync({ type: "blob" });
+  }
+
+  async function startTrain() {
+    setError("");
+    setStatusJson(null);
+    setJobId("");
+
+    if (!files || files.length < 2) {
       setError("이미지 최소 2장 필요");
       return;
     }
 
-    setError("");
-    setStatus("");
-    setJobId("");
-    setPlyUrl("");
-
-    const form = new FormData();
-    Array.from(files).forEach((f) => form.append("files", f));
-
+    setIsUploading(true);
     try {
-      const res = await fetch(`${API_BASE}/train`, {
+      const zipBlob = await buildZipBlob(files);
+
+      const form = new FormData();
+      // ✅ 서버가 요구하는 필드명: images_zip
+      form.append("images_zip", zipBlob, "images.zip");
+
+      const res = await fetch(`${API_BASE}/api/train`, {
         method: "POST",
         body: form,
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text);
+      const text = await res.text();
+      let data: AnyObj = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        // JSON이 아니면 그대로 표시
+        throw new Error(`train 응답이 JSON이 아님: ${text.slice(0, 200)}`);
       }
 
-      const data = await res.json();
-      setJobId(data.job_id);
-      setStatus("queued");
-    } catch (err: any) {
-      setError("train 요청 실패: " + err.message);
+      if (!res.ok) {
+        // FastAPI 기본 에러 포맷: {"detail":...}
+        const msg = data?.detail
+          ? typeof data.detail === "string"
+            ? data.detail
+            : JSON.stringify(data.detail)
+          : JSON.stringify(data);
+        throw new Error(`train 실패 (${res.status}): ${msg}`);
+      }
+
+      // openapi description에 따르면 job_id + status_url + gaussians_url 반환
+      const jid = data.job_id || data.jobId || data.id;
+      if (!jid) throw new Error(`job_id를 못 받음: ${JSON.stringify(data)}`);
+
+      setJobId(String(jid));
+      setStatusJson(data); // 첫 응답도 표시
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setIsUploading(false);
     }
   }
 
+  async function fetchStatus(jid: string) {
+    const res = await fetch(`${API_BASE}/api/jobs/${jid}`, { method: "GET" });
+    const text = await res.text();
+
+    let data: AnyObj = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      // JSON이 아니면 그대로
+      data = { raw: text };
+    }
+
+    if (!res.ok) {
+      const msg = data?.detail
+        ? typeof data.detail === "string"
+          ? data.detail
+          : JSON.stringify(data.detail)
+        : JSON.stringify(data);
+      throw new Error(`status 실패 (${res.status}): ${msg}`);
+    }
+
+    return data;
+  }
+
+  // 자동 폴링
   useEffect(() => {
-    if (!jobId) return;
+    let timer: any;
 
-    const interval = setInterval(async () => {
+    async function tick() {
+      if (!isPolling) return;
+      if (!jobId) return;
+
       try {
-        const res = await fetch(`${API_BASE}/status/${jobId}`);
-        if (!res.ok) return;
+        const data = await fetchStatus(jobId);
+        setStatusJson(data);
+      } catch (e: any) {
+        setError(e?.message || String(e));
+      }
+    }
 
-        const data = await res.json();
-        setStatus(data.status);
+    if (isPolling && jobId) {
+      // 바로 1번 치고, 이후 2.5초
+      tick();
+      timer = setInterval(tick, 2500);
+    }
 
-        if (data.status === "done") {
-          clearInterval(interval);
-          setPlyUrl(`${API_BASE}/download/${jobId}`);
-        }
-
-        if (data.status === "failed") {
-          clearInterval(interval);
-        }
-      } catch (e) {}
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [jobId]);
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [isPolling, jobId]);
 
   return (
-    <main style={{ padding: 40 }}>
-      <h1>CSRAI TRAIN TEST ��</h1>
+    <main style={{ padding: 32, maxWidth: 980, margin: "0 auto" }}>
+      <h1 style={{ fontSize: 26, fontWeight: 800, marginBottom: 8 }}>
+        CSRAI TRAIN TEST 🧪
+      </h1>
 
-      <input
-        type="file"
-        multiple
-        accept="image/*"
-        onChange={(e) => setFiles(e.target.files)}
-      />
+      <div style={{ marginTop: 14 }}>
+        <input
+          type="file"
+          multiple
+          accept="image/*"
+          onChange={(e) => setFiles(e.target.files)}
+        />
+        <div style={{ marginTop: 8, color: "#666" }}>
+          {files?.length ? `${files.length}개 파일 선택됨` : "선택한 파일 없음"}
+        </div>
+      </div>
 
-      <br />
-      <br />
+      <div style={{ marginTop: 16 }}>
+        <button
+          onClick={startTrain}
+          disabled={!canStart || isUploading}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            cursor: !canStart || isUploading ? "not-allowed" : "pointer",
+            fontWeight: 700,
+          }}
+        >
+          {isUploading ? "업로드/zip 생성 중..." : "재구성 시작 (train)"}
+        </button>
 
-      <button onClick={startTrain} disabled={!canStart}>
-        재구성 시작
-      </button>
+        <label style={{ marginLeft: 14, userSelect: "none" }}>
+          <input
+            type="checkbox"
+            checked={isPolling}
+            onChange={(e) => setIsPolling(e.target.checked)}
+            disabled={!jobId}
+            style={{ marginRight: 8 }}
+          />
+          자동 폴링 (2.5s)
+        </label>
+
+        <button
+          onClick={async () => {
+            if (!jobId) return;
+            setError("");
+            try {
+              const data = await fetchStatus(jobId);
+              setStatusJson(data);
+            } catch (e: any) {
+              setError(e?.message || String(e));
+            }
+          }}
+          disabled={!jobId}
+          style={{
+            padding: "10px 14px",
+            marginLeft: 10,
+            borderRadius: 10,
+            border: "1px solid #ddd",
+            cursor: !jobId ? "not-allowed" : "pointer",
+            fontWeight: 700,
+          }}
+        >
+          상태 1회 체크
+        </button>
+      </div>
+
+      <div style={{ marginTop: 14, color: "#444" }}>
+        <div>
+          <b>API:</b> {API_BASE}
+        </div>
+        <div>
+          <b>jobId:</b> {jobId || "-"}
+        </div>
+      </div>
 
       {error && (
-        <div style={{ color: "red", marginTop: 20 }}>
+        <div style={{ marginTop: 14, color: "#b91c1c", fontWeight: 700 }}>
           {error}
         </div>
       )}
 
-      {jobId && (
-        <div style={{ marginTop: 20 }}>
-          <div>Job ID: {jobId}</div>
-          <div>Status: {status}</div>
+      {statusJson && (
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontWeight: 800, marginBottom: 8 }}>status json</div>
+          <pre
+            style={{
+              padding: 12,
+              border: "1px solid #eee",
+              borderRadius: 12,
+              background: "#fafafa",
+              overflow: "auto",
+              maxHeight: 240,
+              fontSize: 12,
+              lineHeight: 1.4,
+            }}
+          >
+            {JSON.stringify(statusJson, null, 2)}
+          </pre>
         </div>
       )}
 
-      {plyUrl && (
-        <div style={{ marginTop: 40 }}>
-          <h3>PLY Viewer</h3>
+      {/* PLY 다운로드 엔드포인트가 준비되어 있으면 렌더링 */}
+      {jobId && (
+        <div style={{ marginTop: 24 }}>
+          <div style={{ fontWeight: 800, marginBottom: 8 }}>
+            3D Preview (gaussians.ply)
+          </div>
+
+          <div style={{ marginBottom: 10, fontSize: 13, color: "#555" }}>
+            아래 URL이 실제 ply 다운로드 엔드포인트야:
+            <div style={{ fontFamily: "monospace" }}>{plyUrl}</div>
+          </div>
+
           <PLYViewer plyUrl={plyUrl} />
         </div>
       )}
