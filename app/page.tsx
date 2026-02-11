@@ -6,91 +6,89 @@ import React, { useEffect, useMemo, useState } from "react";
 import JSZip from "jszip";
 import PLYViewer from "./ply-viewer";
 
+type JobStatus = "queued" | "running" | "done_sparse" | "done_3dgs" | "failed";
+
 type AnyObj = Record<string, any>;
 
-const UPSTREAM_HINT =
+const API_BASE =
   (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "") ||
-  "(set NEXT_PUBLIC_API_BASE optional)";
+  "http://127.0.0.1:8000";
 
-// ✅ 브라우저는 같은 도메인(=Vercel)만 호출한다. CORS 회피.
-const PROXY_BASE = "/api/proxy";
+async function zipImages(files: FileList): Promise<Blob> {
+  const zip = new JSZip();
+  Array.from(files).forEach((f, i) => {
+    const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
+    zip.file(`img_${String(i).padStart(3, "0")}.${ext}`, f);
+  });
+
+  // 압축은 CPU/시간만 잡아먹어서 STORE 권장 (서버가 어차피 받기만 하면 됨)
+  return await zip.generateAsync({ type: "blob", compression: "STORE" });
+}
 
 export default function Page() {
   const [files, setFiles] = useState<FileList | null>(null);
 
+  const [jobId, setJobId] = useState<string>("");
+  const [status, setStatus] = useState<JobStatus | "">("");
+  const [statusJson, setStatusJson] = useState<AnyObj | null>(null);
+
   const [isUploading, setIsUploading] = useState(false);
   const [isPolling, setIsPolling] = useState(true);
 
-  const [jobId, setJobId] = useState<string>("");
-  const [statusJson, setStatusJson] = useState<AnyObj | null>(null);
   const [error, setError] = useState<string>("");
-
-  const canStart = useMemo(() => !!files && files.length >= 2, [files]);
 
   const plyUrl = useMemo(() => {
     if (!jobId) return "";
-    // ✅ ply도 프록시로
-    return `${PROXY_BASE}/jobs/${jobId}/gaussians.ply`;
+    return `${API_BASE}/api/jobs/${jobId}/gaussians.ply`;
   }, [jobId]);
 
-  async function buildZipBlob(selected: FileList): Promise<Blob> {
-    const zip = new JSZip();
-    const arr = Array.from(selected).sort((a, b) => a.name.localeCompare(b.name));
-
-    for (let i = 0; i < arr.length; i++) {
-      const f = arr[i];
-      const ext = (f.name.split(".").pop() || "jpg").toLowerCase();
-      const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
-      const fname = String(i).padStart(3, "0") + "." + safeExt;
-      zip.file(fname, f);
-    }
-
-    return await zip.generateAsync({ type: "blob" });
-  }
+  const canStart = useMemo(() => !!files && files.length >= 2, [files]);
 
   async function startTrain() {
     setError("");
-    setStatusJson(null);
     setJobId("");
+    setStatus("");
+    setStatusJson(null);
 
-    if (!files || files.length < 2) {
-      setError("이미지 최소 2장 필요");
+    if (!files || !canStart) {
+      setError("사진을 최소 2장 이상 선택해줘.");
       return;
     }
 
-    setIsUploading(true);
     try {
-      const zipBlob = await buildZipBlob(files);
+      setIsUploading(true);
 
+      // 1) zip 생성
+      const zipBlob = await zipImages(files);
+
+      // 2) Runpod FastAPI 스펙: multipart/form-data with images_zip
       const form = new FormData();
       form.append("images_zip", zipBlob, "images.zip");
 
-      const res = await fetch(`${PROXY_BASE}/train`, {
+      const res = await fetch(`${API_BASE}/api/train`, {
         method: "POST",
         body: form,
       });
 
       const text = await res.text();
-      let data: AnyObj = {};
+      let data: AnyObj;
       try {
-        data = text ? JSON.parse(text) : {};
+        data = JSON.parse(text);
       } catch {
         throw new Error(`train 응답이 JSON이 아님: ${text.slice(0, 200)}`);
       }
 
       if (!res.ok) {
-        const msg = data?.detail
-          ? typeof data.detail === "string"
-            ? data.detail
-            : JSON.stringify(data.detail)
-          : JSON.stringify(data);
-        throw new Error(`train 실패 (${res.status}): ${msg}`);
+        throw new Error(`train 실패 ${res.status}: ${JSON.stringify(data)}`);
       }
 
-      const jid = data.job_id || data.jobId || data.id;
-      if (!jid) throw new Error(`job_id를 못 받음: ${JSON.stringify(data)}`);
+      const id = data.job_id || data.jobId || data.id;
+      if (!id) {
+        throw new Error(`train 응답에 job_id 없음: ${JSON.stringify(data)}`);
+      }
 
-      setJobId(String(jid));
+      setJobId(String(id));
+      setStatus(String(data.status || "queued") as any);
       setStatusJson(data);
     } catch (e: any) {
       setError(e?.message || String(e));
@@ -99,171 +97,137 @@ export default function Page() {
     }
   }
 
-  async function fetchStatus(jid: string) {
-    const res = await fetch(`${PROXY_BASE}/jobs/${jid}`, { method: "GET" });
-    const text = await res.text();
+  async function checkOnce() {
+    if (!jobId) return;
+    setError("");
 
-    let data: AnyObj = {};
     try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { raw: text };
-    }
+      const res = await fetch(`${API_BASE}/api/jobs/${jobId}`, { method: "GET" });
+      const data = await res.json().catch(() => ({}));
 
-    if (!res.ok) {
-      const msg = data?.detail
-        ? typeof data.detail === "string"
-          ? data.detail
-          : JSON.stringify(data.detail)
-        : JSON.stringify(data);
-      throw new Error(`status 실패 (${res.status}): ${msg}`);
-    }
+      if (!res.ok) {
+        throw new Error(`status 실패 ${res.status}: ${JSON.stringify(data)}`);
+      }
 
-    return data;
+      setStatusJson(data);
+      if (data.status) setStatus(data.status);
+
+      // done이면 자동으로 plyUrl이 활성화됨
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    }
   }
 
   useEffect(() => {
-    let timer: any;
+    if (!isPolling || !jobId) return;
 
-    async function tick() {
-      if (!isPolling) return;
-      if (!jobId) return;
+    const t = setInterval(() => {
+      checkOnce();
+    }, 2500);
 
-      try {
-        const data = await fetchStatus(jobId);
-        setStatusJson(data);
-      } catch (e: any) {
-        setError(e?.message || String(e));
-      }
-    }
-
-    if (isPolling && jobId) {
-      tick();
-      timer = setInterval(tick, 2500);
-    }
-
-    return () => timer && clearInterval(timer);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPolling, jobId]);
 
   return (
-    <main style={{ padding: 32, maxWidth: 980, margin: "0 auto" }}>
-      <h1 style={{ fontSize: 26, fontWeight: 800, marginBottom: 8 }}>
-        CSRAI TRAIN TEST 🧪
-      </h1>
-
-      <div style={{ marginTop: 14 }}>
-        <input
-          type="file"
-          multiple
-          accept="image/*"
-          onChange={(e) => setFiles(e.target.files)}
-        />
-        <div style={{ marginTop: 8, color: "#666" }}>
-          {files?.length ? `${files.length}개 파일 선택됨` : "선택한 파일 없음"}
-        </div>
+    <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui" }}>
+      <h1 style={{ fontSize: 28, marginBottom: 6 }}>CSRAI TRAIN TEST 🧪</h1>
+      <div style={{ color: "#666", marginBottom: 18 }}>
+        업로드(직접 Runpod) → /api/train → job 생성 → /api/jobs/&lt;id&gt; 폴링 → gaussians.ply
       </div>
 
-      <div style={{ marginTop: 16 }}>
-        <button
-          onClick={startTrain}
-          disabled={!canStart || isUploading}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            cursor: !canStart || isUploading ? "not-allowed" : "pointer",
-            fontWeight: 700,
-          }}
-        >
-          {isUploading ? "업로드/zip 생성 중..." : "재구성 시작 (train)"}
-        </button>
-
-        <label style={{ marginLeft: 14, userSelect: "none" }}>
+      <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
+        <div style={{ marginBottom: 12 }}>
           <input
-            type="checkbox"
-            checked={isPolling}
-            onChange={(e) => setIsPolling(e.target.checked)}
-            disabled={!jobId}
-            style={{ marginRight: 8 }}
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={(e) => setFiles(e.target.files)}
           />
-          자동 폴링 (2.5s)
-        </label>
-
-        <button
-          onClick={async () => {
-            if (!jobId) return;
-            setError("");
-            try {
-              const data = await fetchStatus(jobId);
-              setStatusJson(data);
-            } catch (e: any) {
-              setError(e?.message || String(e));
-            }
-          }}
-          disabled={!jobId}
-          style={{
-            padding: "10px 14px",
-            marginLeft: 10,
-            borderRadius: 10,
-            border: "1px solid #ddd",
-            cursor: !jobId ? "not-allowed" : "pointer",
-            fontWeight: 700,
-          }}
-        >
-          상태 1회 체크
-        </button>
-      </div>
-
-      <div style={{ marginTop: 14, color: "#444" }}>
-        <div>
-          <b>Upstream hint:</b> {UPSTREAM_HINT}
+          <div style={{ marginTop: 8, color: "#444" }}>
+            {files ? `${files.length}개 파일 선택됨` : "파일 선택 안 됨"}
+          </div>
         </div>
-        <div>
-          <b>Proxy:</b> {PROXY_BASE}
-        </div>
-        <div>
-          <b>jobId:</b> {jobId || "-"}
-        </div>
-      </div>
 
-      {error && (
-        <div style={{ marginTop: 14, color: "#b91c1c", fontWeight: 700 }}>
-          {error}
-        </div>
-      )}
-
-      {statusJson && (
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontWeight: 800, marginBottom: 8 }}>status json</div>
-          <pre
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={startTrain}
+            disabled={!canStart || isUploading}
             style={{
-              padding: 12,
-              border: "1px solid #eee",
-              borderRadius: 12,
-              background: "#fafafa",
-              overflow: "auto",
-              maxHeight: 240,
-              fontSize: 12,
-              lineHeight: 1.4,
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: isUploading ? "#f5f5f5" : "white",
+              cursor: isUploading ? "not-allowed" : "pointer",
+              fontWeight: 700,
             }}
           >
-            {JSON.stringify(statusJson, null, 2)}
-          </pre>
-        </div>
-      )}
+            {isUploading ? "업로드/요청 중..." : "재구성 시작 (train)"}
+          </button>
 
-      {jobId && (
-        <div style={{ marginTop: 24 }}>
-          <div style={{ fontWeight: 800, marginBottom: 8 }}>
-            3D Preview (gaussians.ply)
-          </div>
-          <div style={{ marginBottom: 10, fontSize: 13, color: "#555" }}>
-            ply URL:
-            <div style={{ fontFamily: "monospace" }}>{plyUrl}</div>
-          </div>
-          <PLYViewer plyUrl={plyUrl} />
+          <label style={{ display: "flex", gap: 8, alignItems: "center", color: "#333" }}>
+            <input
+              type="checkbox"
+              checked={isPolling}
+              onChange={(e) => setIsPolling(e.target.checked)}
+              disabled={!jobId}
+            />
+            자동 폴링 (2.5s)
+          </label>
+
+          <button
+            onClick={checkOnce}
+            disabled={!jobId}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: "white",
+              cursor: !jobId ? "not-allowed" : "pointer",
+              fontWeight: 700,
+            }}
+          >
+            상태 1회 체크
+          </button>
         </div>
-      )}
+
+        <div style={{ marginTop: 14, lineHeight: 1.7 }}>
+          <div><b>API:</b> {API_BASE}</div>
+          <div><b>jobId:</b> {jobId || "-"}</div>
+          <div><b>status:</b> {status || "-"}</div>
+        </div>
+
+        {error && (
+          <div style={{ marginTop: 14, color: "#b91c1c", fontWeight: 700, whiteSpace: "pre-wrap" }}>
+            {error}
+          </div>
+        )}
+
+        {statusJson && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>status json</div>
+            <pre style={{ background: "#fafafa", border: "1px solid #eee", padding: 12, borderRadius: 10, overflowX: "auto" }}>
+              {JSON.stringify(statusJson, null, 2)}
+            </pre>
+          </div>
+        )}
+
+        {!!plyUrl && (status === "done_sparse" || status === "done_3dgs") && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>PLY</div>
+            <div style={{ marginBottom: 8 }}>
+              <a href={plyUrl} target="_blank" rel="noreferrer">
+                gaussians.ply 열기/다운로드
+              </a>
+            </div>
+            <PLYViewer url={plyUrl} />
+          </div>
+        )}
+      </div>
+
+      <div style={{ marginTop: 14, color: "#666" }}>
+        ⚠️ Vercel /api/proxy 같은 서버리스 경유 업로드는 “FUNCTION_PAYLOAD_TOO_LARGE”로 터짐 → 반드시 Runpod로 직접 업로드.
+      </div>
     </main>
   );
 }
