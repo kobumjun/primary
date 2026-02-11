@@ -8,16 +8,13 @@ import PLYViewer from "./ply-viewer";
 
 type AnyObj = Record<string, any>;
 
-const API_BASE =
+const UPSTREAM_HINT =
   (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "") ||
-  "http://127.0.0.1:8000";
+  "(set NEXT_PUBLIC_API_BASE optional)";
 
-/**
- * CSRAI UI (Runpod GPU Worker)
- * - POST /api/train  (multipart/form-data: images_zip=@images.zip)
- * - GET  /api/jobs/{job_id}
- * - GET  /api/jobs/{job_id}/gaussians.ply
- */
+// ✅ 브라우저는 같은 도메인(=Vercel)만 호출한다. CORS 회피.
+const PROXY_BASE = "/api/proxy";
+
 export default function Page() {
   const [files, setFiles] = useState<FileList | null>(null);
 
@@ -26,24 +23,19 @@ export default function Page() {
 
   const [jobId, setJobId] = useState<string>("");
   const [statusJson, setStatusJson] = useState<AnyObj | null>(null);
-
   const [error, setError] = useState<string>("");
 
   const canStart = useMemo(() => !!files && files.length >= 2, [files]);
 
   const plyUrl = useMemo(() => {
     if (!jobId) return "";
-    // Runpod worker가 제공하는 다운로드 엔드포인트
-    return `${API_BASE}/api/jobs/${jobId}/gaussians.ply`;
+    // ✅ ply도 프록시로
+    return `${PROXY_BASE}/jobs/${jobId}/gaussians.ply`;
   }, [jobId]);
 
-  // 파일 -> zip(blob) 만들기 (브라우저에서 바로)
   async function buildZipBlob(selected: FileList): Promise<Blob> {
     const zip = new JSZip();
-
-    // 파일명 충돌 방지 + 정렬 안정성
-    const arr = Array.from(selected);
-    arr.sort((a, b) => a.name.localeCompare(b.name));
+    const arr = Array.from(selected).sort((a, b) => a.name.localeCompare(b.name));
 
     for (let i = 0; i < arr.length; i++) {
       const f = arr[i];
@@ -71,10 +63,9 @@ export default function Page() {
       const zipBlob = await buildZipBlob(files);
 
       const form = new FormData();
-      // ✅ 서버가 요구하는 필드명: images_zip
       form.append("images_zip", zipBlob, "images.zip");
 
-      const res = await fetch(`${API_BASE}/api/train`, {
+      const res = await fetch(`${PROXY_BASE}/train`, {
         method: "POST",
         body: form,
       });
@@ -84,12 +75,10 @@ export default function Page() {
       try {
         data = text ? JSON.parse(text) : {};
       } catch {
-        // JSON이 아니면 그대로 표시
         throw new Error(`train 응답이 JSON이 아님: ${text.slice(0, 200)}`);
       }
 
       if (!res.ok) {
-        // FastAPI 기본 에러 포맷: {"detail":...}
         const msg = data?.detail
           ? typeof data.detail === "string"
             ? data.detail
@@ -98,12 +87,11 @@ export default function Page() {
         throw new Error(`train 실패 (${res.status}): ${msg}`);
       }
 
-      // openapi description에 따르면 job_id + status_url + gaussians_url 반환
       const jid = data.job_id || data.jobId || data.id;
       if (!jid) throw new Error(`job_id를 못 받음: ${JSON.stringify(data)}`);
 
       setJobId(String(jid));
-      setStatusJson(data); // 첫 응답도 표시
+      setStatusJson(data);
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -112,14 +100,13 @@ export default function Page() {
   }
 
   async function fetchStatus(jid: string) {
-    const res = await fetch(`${API_BASE}/api/jobs/${jid}`, { method: "GET" });
+    const res = await fetch(`${PROXY_BASE}/jobs/${jid}`, { method: "GET" });
     const text = await res.text();
 
     let data: AnyObj = {};
     try {
       data = text ? JSON.parse(text) : {};
     } catch {
-      // JSON이 아니면 그대로
       data = { raw: text };
     }
 
@@ -135,7 +122,6 @@ export default function Page() {
     return data;
   }
 
-  // 자동 폴링
   useEffect(() => {
     let timer: any;
 
@@ -152,14 +138,11 @@ export default function Page() {
     }
 
     if (isPolling && jobId) {
-      // 바로 1번 치고, 이후 2.5초
       tick();
       timer = setInterval(tick, 2500);
     }
 
-    return () => {
-      if (timer) clearInterval(timer);
-    };
+    return () => timer && clearInterval(timer);
   }, [isPolling, jobId]);
 
   return (
@@ -233,7 +216,10 @@ export default function Page() {
 
       <div style={{ marginTop: 14, color: "#444" }}>
         <div>
-          <b>API:</b> {API_BASE}
+          <b>Upstream hint:</b> {UPSTREAM_HINT}
+        </div>
+        <div>
+          <b>Proxy:</b> {PROXY_BASE}
         </div>
         <div>
           <b>jobId:</b> {jobId || "-"}
@@ -266,18 +252,15 @@ export default function Page() {
         </div>
       )}
 
-      {/* PLY 다운로드 엔드포인트가 준비되어 있으면 렌더링 */}
       {jobId && (
         <div style={{ marginTop: 24 }}>
           <div style={{ fontWeight: 800, marginBottom: 8 }}>
             3D Preview (gaussians.ply)
           </div>
-
           <div style={{ marginBottom: 10, fontSize: 13, color: "#555" }}>
-            아래 URL이 실제 ply 다운로드 엔드포인트야:
+            ply URL:
             <div style={{ fontFamily: "monospace" }}>{plyUrl}</div>
           </div>
-
           <PLYViewer plyUrl={plyUrl} />
         </div>
       )}
