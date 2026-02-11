@@ -8,13 +8,20 @@ function upstreamBase() {
   return u.replace(/\/$/, "");
 }
 
-export async function GET(_req: Request, { params }: { params: { jobId: string } }) {
+export async function GET(req: Request, context: any) {
   const upstream = upstreamBase();
   if (!upstream) {
     return NextResponse.json({ detail: "CSRAI_UPSTREAM env is missing" }, { status: 500 });
   }
 
-  const res = await fetch(`${upstream}/api/jobs/${params.jobId}`, { method: "GET" });
+  const params = await context?.params; // Next가 Promise로 줄 수도 있음
+  const jobId = params?.jobId;
+
+  if (!jobId) {
+    return NextResponse.json({ detail: "jobId missing" }, { status: 400 });
+  }
+
+  const res = await fetch(`${upstream}/api/jobs/${jobId}`, { method: "GET" });
   const buf = await res.arrayBuffer();
 
   return new NextResponse(buf, {
